@@ -7371,6 +7371,58 @@ SESSION-TITLE is an optional display title for the resumed session."
    :on-failure (agent-shell--make-error-handler
                 :state (agent-shell--state) :shell-buffer shell-buffer)))
 
+(cl-defun agent-shell--make-session-list-request (&key cwd cursor)
+  "Return an ACP session/list request for CWD and optional CURSOR.
+
+CURSOR is an opaque token returned as `nextCursor' by a previous
+session/list response.
+
+  (agent-shell--make-session-list-request :cwd \"/tmp\" :cursor \"next\")
+  ;; => ((:method . \"session/list\")
+  ;;     (:params (cursor . \"next\") (cwd . \"/tmp\")))"
+  (let ((request (acp-make-session-list-request :cwd cwd)))
+    (when cursor
+      (map-put! request :params
+                (map-insert (map-elt request :params) 'cursor cursor)))
+    request))
+
+(cl-defun agent-shell--list-sessions (&key state cwd buffer cursor seen-cursors
+                                           sessions on-success on-failure)
+  "Fetch all session/list pages for CWD using STATE and BUFFER.
+
+CURSOR, SEEN-CURSORS, and SESSIONS carry pagination state between
+requests.  Call ON-SUCCESS with all sessions when the agent omits
+`nextCursor'.  Call ON-FAILURE with the ACP error and raw message when a
+request fails or the agent repeats a cursor."
+  (agent-shell--send-request
+   :state state
+   :client (map-elt state :client)
+   :request (agent-shell--make-session-list-request :cwd cwd :cursor cursor)
+   :buffer buffer
+   :on-success
+   (lambda (acp-response)
+     (let ((all-sessions (append sessions
+                                 (append (or (map-elt acp-response 'sessions) '()) nil)))
+           (next-cursor (map-elt acp-response 'nextCursor)))
+       (cond
+        ((not next-cursor)
+         (funcall on-success all-sessions))
+        ((seq-contains-p seen-cursors next-cursor #'equal)
+         (funcall on-failure
+                  '((message . "Agent repeated a session/list cursor"))
+                  nil))
+        (t
+         (agent-shell--list-sessions
+          :state state
+          :cwd cwd
+          :buffer buffer
+          :cursor next-cursor
+          :seen-cursors (cons next-cursor seen-cursors)
+          :sessions all-sessions
+          :on-success on-success
+          :on-failure on-failure)))))
+   :on-failure on-failure))
+
 (cl-defun agent-shell--initiate-session-list-and-load (&key shell-buffer on-session-init)
   "Try loading latest existing session with SHELL-BUFFER and ON-SESSION-INIT."
   (with-current-buffer (map-elt (agent-shell--state) :buffer)
@@ -7380,15 +7432,12 @@ SESSION-TITLE is an optional display title for the resumed session."
      :body "\n\nLooking for existing sessions..."
      :append t))
   (agent-shell--emit-event :event 'session-list)
-  (agent-shell--send-request
+  (agent-shell--list-sessions
    :state (agent-shell--state)
-   :client (map-elt (agent-shell--state) :client)
-   :request (acp-make-session-list-request
-             :cwd (agent-shell--resolve-path (agent-shell-cwd)))
+   :cwd (agent-shell--resolve-path (agent-shell-cwd))
    :buffer (current-buffer)
-   :on-success (lambda (acp-response)
-                 (let ((acp-sessions (agent-shell--sort-sessions-by-recency
-                                      (append (or (map-elt acp-response 'sessions) '()) nil))))
+   :on-success (lambda (acp-sessions)
+                 (let ((acp-sessions (agent-shell--sort-sessions-by-recency acp-sessions)))
                    (condition-case nil
                        (let* ((acp-session
                                (pcase agent-shell-session-strategy
