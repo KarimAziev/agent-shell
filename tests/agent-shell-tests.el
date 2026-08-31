@@ -2811,7 +2811,10 @@ so the command must not append a second time."
 
 (ert-deftest agent-shell--list-sessions-fetches-all-pages-test ()
   "Test `agent-shell--list-sessions' follows cursors through empty pages."
-  (let (failure requests sessions)
+  (let ((agent-shell-session-list-page-limit nil)
+        failure
+        requests
+        sessions)
     (cl-letf (((symbol-function 'agent-shell--send-request)
                (lambda (&rest args)
                  (let* ((request (plist-get args :request))
@@ -2847,6 +2850,56 @@ so the command must not append a second time."
                              (map-elt session 'sessionId))
                            sessions)
                    '("session-1" "session-2")))))
+
+(ert-deftest agent-shell--list-sessions-respects-page-limit-test ()
+  "Test `agent-shell--list-sessions' stops silently at the page limit."
+  (let ((agent-shell-session-list-page-limit 2)
+        failure
+        requests
+        sessions)
+    (cl-letf (((symbol-function 'agent-shell--send-request)
+               (lambda (&rest args)
+                 (let* ((request (plist-get args :request))
+                        (cursor (map-nested-elt request '(:params cursor))))
+                   (push request requests)
+                   (funcall
+                    (plist-get args :on-success)
+                    (if cursor
+                        '((sessions . []) (nextCursor . "page-3"))
+                      '((sessions . [((sessionId . "session-1"))])
+                        (nextCursor . "page-2"))))))))
+      (agent-shell--list-sessions
+       :state '((:client . test-client))
+       :cwd "/tmp"
+       :buffer (current-buffer)
+       :on-success (lambda (result) (setq sessions result))
+       :on-failure (lambda (&rest args) (setq failure args))))
+    (should-not failure)
+    (should (equal (mapcar (lambda (request)
+                             (map-nested-elt request '(:params cursor)))
+                           (nreverse requests))
+                   '(nil "page-2")))
+    (should (equal (mapcar (lambda (session)
+                             (map-elt session 'sessionId))
+                           sessions)
+                   '("session-1")))))
+
+(ert-deftest agent-shell--list-sessions-rejects-invalid-page-limit-test ()
+  "Test `agent-shell--list-sessions' rejects invalid page limits."
+  (dolist (page-limit '(0 -1 1.5 "2"))
+    (let ((agent-shell-session-list-page-limit page-limit)
+          request-sent)
+      (cl-letf (((symbol-function 'agent-shell--send-request)
+                 (lambda (&rest _args) (setq request-sent t))))
+        (should-error
+         (agent-shell--list-sessions
+          :state '((:client . test-client))
+          :cwd "/tmp"
+          :buffer (current-buffer)
+          :on-success #'ignore
+          :on-failure #'ignore)
+         :type 'user-error))
+      (should-not request-sent))))
 
 (ert-deftest agent-shell--list-sessions-rejects-repeated-cursor-test ()
   "Test `agent-shell--list-sessions' stops when an agent repeats a cursor."
